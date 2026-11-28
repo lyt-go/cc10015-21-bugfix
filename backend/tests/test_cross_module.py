@@ -372,19 +372,25 @@ def test_cruise_log_abnormal_triggers_safety():
     from app.services.cruise_log import CruiseLogService
     svc = CruiseLogService()
 
+    # 给一台设备明确出厂编号，日志按编号点名该设备
+    equip_rows = _samples("equipment_manifest")
+    equip_rows[0]["出厂编号"] = "EQUI-SAFE-1"
+    equip_rows[0]["保管班组"] = "甲板一班"
+
     log_rows = _samples("cruise_log")
     log_rows[0]["异常事件"] = "主机转速异常，设备过热"
     log_rows[0]["设备运行"] = "主机异常"
+    log_rows[0]["出厂编号"] = "EQUI-SAFE-1"
     log_rows[0]["status"] = "待填写"
 
     entry, msg = svc.run_action(1, "提交日志")
     assert entry is not None, f"提交失败: {msg}"
     assert entry.get("has_abnormal") == True, "应标记异常事件"
 
-    # 验证设备收到告警
-    equip_rows = _samples("equipment_manifest")
-    alerted = any(r.get("log_alert") for r in equip_rows)
-    assert alerted, "设备应收到日志异常告警"
+    # 验证只有被出厂编号点名的设备收到告警，其他设备不被扇出
+    alerted = [r for r in equip_rows if r.get("log_alert")]
+    assert len(alerted) == 1, f"应仅一台设备收到告警，实际{len(alerted)}台"
+    assert alerted[0]["出厂编号"] == "EQUI-SAFE-1"
 
 
 # ============================================================

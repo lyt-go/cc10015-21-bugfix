@@ -29,3 +29,21 @@ class EntryPayload(BaseModel):
 class ActionPayload(BaseModel):
     action: str
     remark: str | None = None
+
+
+class IdentityPayload(BaseModel):
+    """旧日志补查设备身份时提交的出厂编号。"""
+    serial: str
+
+
+class TransferPayload(BaseModel):
+    """设备保管交接凭据：新保管班组必填，新保管人与说明可选。"""
+    new_team: str
+    new_keeper: str | None = ""
+    note: str | None = ""
+
+
+class ReviewSettlePayload(BaseModel):
+    """复核指派单核销/拒绝：action 仅支持「核销」「拒绝」。"""
+    action: str
+    reason: str | None = ""

@@ -9,8 +9,17 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
+from app.schemas import (
+    ActionPayload,
+    ActionResult,
+    EntryPayload,
+    IdentityPayload,
+    PageResult,
+    ReviewSettlePayload,
+    TransferPayload,
+)
 from app.services import service_for
+from app.services import safety_review
 from app.store import store
 
 router = APIRouter(prefix="/api", tags=["业务资源"])
@@ -69,9 +78,19 @@ def module_snapshot(module: str) -> dict[str, Any]:
         pending_approval = sum(1 for r in store.rows("analysis_request") if r.get("status") == "已提交")
         cross["pending_approval_count"] = pending_approval
     elif module == "equipment_manifest":
+        equip_rows = store.rows("equipment_manifest")
         calib_rows = store.rows("instrument_calib")
         failed_calibs = sum(1 for r in calib_rows if r.get("status") == "不合格")
         cross["failed_calibrations"] = failed_calibs
+        review_rows = store.rows(safety_review.ASSIGNMENT_TABLE)
+        cross["open_review_assignments"] = sum(
+            1 for r in review_rows if r.get("status") in safety_review.ASSIGNMENT_OPEN_STATUSES
+        )
+        cross["blocked_equipment"] = sum(1 for r in equip_rows if r.get("usage_blocked"))
+        cross["transfer_in_progress"] = sum(
+            1 for r in store.rows(safety_review.TRANSFER_TABLE)
+            if r.get("status") == safety_review.TRANSFER_OPEN_STATUS
+        )
     elif module == "crew_schedule":
         diving_rows = store.rows("diving_ops")
         aborted_dives = sum(1 for r in diving_rows if r.get("status") == "已中止")
@@ -111,6 +130,17 @@ def module_snapshot(module: str) -> dict[str, Any]:
         cross["plan_changed"] = plan_changed
         results_rows = store.rows("results_compile")
         cross["total_results"] = len(results_rows)
+    elif module == "cruise_log":
+        review_rows = store.rows(safety_review.ASSIGNMENT_TABLE)
+        cross["open_review_assignments"] = sum(
+            1 for r in review_rows if r.get("status") in safety_review.ASSIGNMENT_OPEN_STATUSES
+        )
+        cross["identity_pending_lookup"] = sum(
+            1 for r in store.rows("cruise_log") if r.get("identity_pending_lookup")
+        )
+        cross["review_handed_back"] = sum(
+            1 for r in store.rows("cruise_log") if r.get("复核接手班组")
+        )
     
     base["cross_reference"] = cross
     return base
@@ -138,6 +168,77 @@ def cross_links() -> dict[str, Any]:
     for source, target_list in module_links.items():
         links.append({"source": source, "links": target_list})
     return {"links": links}
+
+
+# ----------------------------------------------------------------------
+# 设备安全复核 / 保管交接 / 日志补查的专用端点
+# 必须声明在通用 /{module} 路由之前，避免被通用规则吞掉
+# ----------------------------------------------------------------------
+@router.get("/equipment/{equipment_id}/detail")
+def equipment_detail(equipment_id: int) -> dict[str, Any]:
+    """设备详情：关联实际出厂编号的复核指派单与保管交接记录。"""
+    from app.services.equipment_manifest import EquipmentManifestService
+    detail = EquipmentManifestService().equipment_detail(equipment_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail=f"设备记录 {equipment_id} 不存在")
+    return detail
+
+
+@router.get("/equipment/reviews/{serial}")
+def reviews_by_serial(serial: str) -> dict[str, Any]:
+    """物资员按出厂编号回查具体复核依据。"""
+    rows = safety_review.assignments_for_serial(serial)
+    return {"出厂编号": serial, "items": rows, "total": len(rows)}
+
+
+@router.post("/equipment/{equipment_id}/transfers", response_model=ActionResult)
+def start_transfer(equipment_id: int, payload: TransferPayload) -> ActionResult:
+    from app.services.equipment_manifest import EquipmentManifestService
+    entry, message = EquipmentManifestService().start_transfer(
+        equipment_id, new_team=payload.new_team,
+        new_keeper=payload.new_keeper or "", note=payload.note or "",
+    )
+    return ActionResult(ok=entry is not None, message=message, entry=entry)
+
+
+@router.post("/equipment/{equipment_id}/transfers/complete", response_model=ActionResult)
+def complete_transfer(equipment_id: int) -> ActionResult:
+    from app.services.equipment_manifest import EquipmentManifestService
+    entry, message = EquipmentManifestService().complete_transfer(equipment_id)
+    return ActionResult(ok=entry is not None, message=message, entry=entry)
+
+
+@router.post("/equipment/{equipment_id}/transfers/cancel", response_model=ActionResult)
+def cancel_transfer(equipment_id: int) -> ActionResult:
+    from app.services.equipment_manifest import EquipmentManifestService
+    entry, message = EquipmentManifestService().cancel_transfer(equipment_id)
+    return ActionResult(ok=entry is not None, message=message, entry=entry)
+
+
+@router.post("/equipment/{equipment_id}/usage", response_model=ActionResult)
+def request_usage(equipment_id: int) -> ActionResult:
+    """物资员领用设备：用复核指派单核销或拒绝指定设备的后续领用。"""
+    from app.services.equipment_manifest import EquipmentManifestService
+    entry, message = EquipmentManifestService().request_usage(equipment_id)
+    return ActionResult(ok=entry is not None, message=message, entry=entry)
+
+
+@router.post("/reviews/{assignment_id}/settle", response_model=ActionResult)
+def settle_review(assignment_id: int, payload: ReviewSettlePayload) -> ActionResult:
+    """核销或拒绝复核指派单，并向航次日志回传接手班组。"""
+    from app.services.equipment_manifest import EquipmentManifestService
+    entry, message = EquipmentManifestService().settle_review(
+        assignment_id, action=payload.action.strip(), reason=payload.reason or "",
+    )
+    return ActionResult(ok=entry is not None, message=message, entry=entry)
+
+
+@router.post("/cruise-logs/{entry_id}/supplement-identity", response_model=ActionResult)
+def supplement_identity(entry_id: int, payload: IdentityPayload) -> ActionResult:
+    """旧日志缺少设备编号时补查出厂编号，重新定位唯一设备。"""
+    from app.services.cruise_log import CruiseLogService
+    entry, message = CruiseLogService().supplement_identity(entry_id, payload.serial)
+    return ActionResult(ok=entry is not None, message=message, entry=entry)
 
 
 @router.get("/{module}", response_model=PageResult[dict])
